@@ -1,0 +1,474 @@
+---
+title: "Merging and prepping | COI"
+author: "Olivier Laroche"
+date: "September, 2024"
+output: 
+  distill::distill_article:
+    toc: true
+    css: dark_theme.css
+    center: true
+code_folding: true
+---
+
+### Loading libraries
+
+```{r Loading libraries, message=FALSE, warning=FALSE, code_folding=TRUE, include=FALSE}
+library(biohelper)
+library(data.table)
+library(Biostrings)
+library(janitor)
+library(ggthemes)
+library(DT)
+library(tibble)
+library(tidyverse)
+library(UpSetR)
+library(vegan)
+library(plotly)
+library(crosstalk)
+library(ranacapa)
+library(plyr)
+library(glue)
+library(microViz)
+library(theseus)
+library(distill)
+```
+
+
+### Setting the environment
+
+```{r}
+path_8A_data = "../../../Data/metabarcoding/COI/DADA2_results/Cleaned_data/"
+path_7AB_data = "../../../../Cruises_7A-7B/Metabarcoding_data/Cleaned_data/COI"
+path_7AB_twenty_data = "../../../../Cruises_7A-7B/Metabarcoding_data/Cleaned_data/COI_twenty"
+path_5ABC_data = "../../../../Cruises_7A-7B/Metabarcoding_data/Cleaned_data/COI_5ABC"
+
+path_merged_data = "../../../Data/metabarcoding/COI/Merged_data"
+dir.create(path_merged_data)
+dir.create(paste0(path_merged_data, "/Sequencing_depth"))
+dir.create(paste0(path_merged_data, "/NUMTs_filtering_COInr"))
+dir.create(paste0(path_merged_data, "/NUMTs_filtering_COInr/clean_data"))
+```
+
+
+### Loading the ps objects
+
+```{r Loading files, echo=FALSE, message=FALSE, warning=FALSE, code_folding=TRUE}
+ps_8A = readRDS(paste0(path_8A_data,"/ps_clean.rds")) %>% 
+  subset_samples(project == "TMC8A") %>% 
+  phyloseq::filter_taxa(function(x) sum(x) >0, TRUE)
+#ps_8A@refseq %>% ape::as.DNAbin()
+ps_8A
+
+ps_7AB = readRDS(paste0(path_7AB_data,"/ps_clean.rds"))
+#ps_7AB@refseq %>% ape::as.DNAbin()
+
+ps_7AB_twenty = readRDS(paste0(path_7AB_twenty_data,"/ps_clean.rds"))
+#ps_7AB_twenty@refseq %>% ape::as.DNAbin()
+
+ps_5ABC = readRDS(paste0(path_5ABC_data,"/ps_clean.rds"))
+#ps_5ABC@refseq %>% ape::as.DNAbin()
+
+ps = merge_phyloseq(ps_8A, ps_7AB, ps_7AB_twenty, ps_5ABC)
+ps
+
+# ps_previous = readRDS(file = "../../../../Cruises_7A-7B/Metabarcoding_data/Cleaned_data/Merged_data/COI/NUMTs_filtering_COInr/metamate_out/ref_seq_filtered/new_taxo_assignment/ps_superclean_updated_wTree.rds")
+# ps_previous
+# 
+# ps = merge_phyloseq(ps_8A,ps_previous)
+```
+
+# Removing rare taxa
+
+```{r}
+# Removing rare taxa
+ps_trimmed = phyloseq::filter_taxa(ps %>% phyloseq_validate(), function(x) sum(x > 10) > 1, TRUE)
+ps_trimmed
+sample_sums(ps_trimmed) %>% sort() %>% head()
+
+paste0("Percent of lost reads from removing rare taxa: ",100-round((ps_trimmed %>% sample_sums() %>% sum()) / (ps %>% sample_sums() %>% sum())*100,2),"%")
+paste0("Percent of lost ASVs from removing rare taxa: ",100-round((ntaxa(ps_trimmed)) / (ntaxa(ps))*100,2),"%")
+
+### Saving fasta file
+writeXStringSet(ps_trimmed@refseq, paste0(path_merged_data,"/ref_seq.fasta"))
+```
+
+### Looking at sequencing depth per sample with rarefaction curves
+
+```{r warning=FALSE, , message=FALSE, collapse=TRUE, include=FALSE}
+ps_trimmed <- prune_samples(sample_sums(ps_trimmed)>100, ps_trimmed)
+ps_trimmed_low <- prune_samples(sample_sums(ps_trimmed)<5000, ps_trimmed)
+
+s = sample_sums(ps_trimmed_low) %>% sort()
+x = split(s, ceiling(seq_along(s)/10))
+xx <- plyr::ldply(x, function(x){
+    plyr::rename(ldply(x, function(z) {data.frame(read_count=z)}),c(".id" = ".id2"))
+})
+xx =xx %>% dplyr::group_by(.id) %>% dplyr::mutate(.id3 = max(read_count))
+xx = xx[match(sample_names(ps_trimmed_low),xx$.id2),]
+ps_trimmed_low@sam_data$read_count_gr = paste0("Group_",xx$.id," (<=",xx$.id3,")")
+ps_trimmed_low@sam_data$read_count_gr = factor(ps_trimmed_low@sam_data$read_count_gr, levels = gtools::mixedsort(ps_trimmed_low@sam_data$read_count_gr %>% unique()))
+p <- ranacapa::ggrare(ps_trimmed_low, step = 1000, color = "read_count_gr",  se = FALSE)
+p <- p + facet_wrap(~read_count_gr,scales = "free_x") + theme_bw() + ylab("ASV richness") + xlab("Sequencing depth") + guides(color=guide_legend(title="Sequencing depth")) + theme(axis.text.x = element_text(angle = 45))
+ggsave(plot = p, filename = "rarefaction_curves.pdf", path = paste0(path_merged_data, "/Sequencing_depth"), device = "pdf", width = 12, height = 8)
+```
+
+```{r echo=FALSE, fig.height=8, fig.width=16, message=FALSE, warning=FALSE}
+ggplotly(p)
+```
+
+
+### Removing samples with very low read counts
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+df_read_count = ps_trimmed %>% phyloseq::sample_sums() %>% sort() %>% as.data.frame(col.names = "Reads")
+colnames(df_read_count) = "Read count"
+df_read_count %>% datatable(class = 'cell-border stripe', caption = "Read count per sample after decontamination", options = list(pageLength = 50))
+
+# Filtering samples -------------------------------------------------
+ps_trimmed_min <- prune_samples(sample_sums(ps_trimmed)>=2000, ps_trimmed) %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE)
+
+# Saving fasta file
+writeXStringSet(ps_trimmed_min@refseq, paste0(path_merged_data, "/ref_seq.fasta"))
+saveRDS(object = ps_trimmed_min, file = paste0(path_merged_data,"/ps_cleanedMerged.rds"))
+```
+
+
+### Removing putative NUMTS
+See https://pypi.org/project/metaMATE/ 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+writeXStringSet(ps_trimmed_min@refseq,paste0(path_merged_data,"/ref_seq.fasta"))
+ASV_table = ps_trimmed_min %>% pstoveg_otu() %>% t() %>% as.data.frame() %>% rownames_to_column('feature-id') 
+write.table(ASV_table,paste0(path_merged_data,'/ASV_table.txt'), quote = F, row.names = F, sep = "\t")
+
+refdb="/Users/olivier/Dropbox/bioinformatics/mkCOInr/data/Leray_COI/COInr/rdp/trimmed_COInr_rdp_trainseq.fasta"
+spec="/Users/olivier/Dropbox/R_scripts_N_bioinfo/metamate/specifications.txt"
+
+cat("\nIdentifying NUMTS\n")
+system2("metamate", args = c("find",
+                           paste0("-A ",path_merged_data,"/ref_seq.fasta"),
+                           paste0("--readmap ",path_merged_data,"/ASV_table.txt"),
+                           paste0("-R ",refdb),
+                           paste0("--specification ",spec),
+                           "--realign",
+                           "--minimumlength 100",
+                           "--maximumlength 550",
+                           "--threads 8",
+                           paste0("-o ",path_merged_data,"/NUMTs_filtering_COInr/metamate_out"),
+                           "--overwrite"))
+```
+
+*** Any sequence that includes indels or stop codons is designated as verified nonauthentic.
+*** Any sequence that matches a reference sequence (similarity >=99.9% and seq coverage >=80% by default) is designated verified authentic 
+
+Let's aim for very high verifiedauthentic_retained_p (100% ideally) and a very low verifiednonauthentic_retained_p
+
+
+Comparing taxo assignment scores at different accuracy levels
+```{r message=FALSE, warning=FALSE}
+metamate_res = fread(paste0(path_merged_data,"/NUMTs_filtering_COInr/metamate_out/ref_seq_results.csv"))
+metamate_res_trimmed = metamate_res %>% dplyr::arrange(desc(recall_score),desc(accuracy_score))
+index = metamate_res_trimmed$resultindex[1]
+
+paste0("The best index according to recall and accuracy score is: ", metamate_res_trimmed$resultindex[1],". This would retain ",round(metamate_res_trimmed$asvsprelim_retained_p[1]*100,2),"% of the features (ASVs/OTUs), with an accuracy of ",round(metamate_res_trimmed$accuracy_score[1]*100,2),"%, a precison score of ", round(metamate_res_trimmed$precision_score[1]*100,2),"% and a recall score of ",round(metamate_res_trimmed$recall_score[1],2))
+
+cat("\nDumping the NUMTS\n")
+system2("metamate", args = c("dump",
+                           paste0("-A ",path_merged_data,"/ref_seq.fasta"),
+                           paste0("-C ",path_merged_data,"/NUMTs_filtering_COInr/metamate_out/ref_seq_resultcache"),
+                           paste0("-i ",index),
+                           paste0("-o ",path_merged_data,"/NUMTs_filtering_COInr/metamate_out/ref_seq_filtered"),
+                           "--overwrite"))
+```
+
+The accuracy score measures the proportion of correctly predicted instances out of the total instances.
+The recall score (also known as the sensitivity score) measure the proportion of correctly identified positives (herein verified authentic). A score of 1 means perfect classification of these.
+
+```{r}
+fasvs = readDNAStringSet(paste0(path_merged_data,"/NUMTs_filtering_COInr/metamate_out/ref_seq_filtered/ref_seq"))
+
+cat('\nHighest recall and accuracy')
+ps = readRDS(paste0(path_merged_data,"/ps_cleanedMerged.rds")) %>% 
+  prune_taxa(taxa = names(fasvs))
+ps  = phyloseq::prune_samples(phyloseq::sample_sums(ps) >0,ps)
+ps@tax_table@.Data %>% as.data.frame() %>% taxo_assignment_summary(ranks = c("superkingdom","kingdom","phylum","class","order","family","genus","species"))
+ps
+
+writeXStringSet(ps@refseq, paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ref_seq.fasta"))
+saveRDS(ps, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged.rds"))
+```
+
+
+Looking into proportion of validated NUMTs in trimmed data
+```{r}
+# vNUMTs = fread("../../Metabarcoding_data/Cleaned_data/Merged_data/COI/NUMTs_filtering/metamate_out/ref_seq_control.txt", header = F) %>% 
+#   set_colnames(c("type","asv")) %>% 
+#   dplyr::filter(type == "stopfail")
+# which(vNUMTs$asv %in% taxa_names(ps)) %>% length()
+# which(vNUMTs$asv %in% taxa_names(ps_462)) %>% length()
+# ### ***** OK, so basically, all vNUMTs are automatically removed from the dataset, regardless of the thresholds used. The percent retained in results just tells us what would have happend to these NUMTs if they had been identified based on thresholds only.
+# 
+# vnon_NUMTs = fread("../../Metabarcoding_data/Cleaned_data/COI/NUMTs_filtering/metamate_out/ref_seq_control.txt", header = F) %>% 
+#   set_colnames(c("type","asv")) %>% 
+#   dplyr::filter(type != "stopfail")
+# which(vnon_NUMTs$asv %in% taxa_names(ps)) %>% length()
+# which(vnon_NUMTs$asv %in% taxa_names(ps_462)) %>% length()
+```
+
+
+
+### Deep taxonomy assignment
+Keeping only ASVs that were not previously assigned
+```{r}
+ps = readRDS(file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged.rds"))
+ps_previous = readRDS(file ="../../../Data/metabarcoding/COI/outdated/Merged_data/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds")
+ps_trimmed = ps %>% pop_taxa(undesiredTaxa = taxa_names(ps_previous))
+ps_trimmed
+writeXStringSet(ps_trimmed@refseq, paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ref_seq_trimmed.fasta"))
+
+# # Also creating a test set
+# ps_trimmed_100 = ps_trimmed %>% prune_taxa(taxa = ps_trimmed %>% microViz::tax_top(n = 100))
+# writeXStringSet(ps_trimmed_100@refseq, paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ref_seq_trimmed_100.fasta"))
+```
+
+```{bash eval=FALSE, include=FALSE}
+Rscript COI_extra_taxo_assignment_05_09_24.R
+```
+
+### Adding updated taxnonomy
+```{r}
+ps = readRDS(file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged.rds"))
+ps_previous = readRDS(file ="../../../Data/metabarcoding/COI/outdated/Merged_data/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds")
+ps_trimmed = ps %>% pop_taxa(undesiredTaxa = taxa_names(ps_previous))
+
+taxo_ps_trimmed = fread("../../../Data/metabarcoding/COI/Merged_data/NUMTs_filtering_COInr/clean_data/new_taxo_assignment/consensus_taxonomy.csv")
+ps_trimmed = ps_trimmed %>% prune_taxa(taxa = taxo_ps_trimmed$feature_id)
+taxo_ps_trimmed = taxo_ps_trimmed[match(taxa_names(ps_trimmed), taxo_ps_trimmed$feature_id ),]
+all(taxo_ps_trimmed$feature_id==taxa_names(ps_trimmed))
+
+tax_previous = ps_previous@tax_table@.Data %>% as.data.frame() %>% 
+  dplyr::select(-c(otu)) %>% rownames_to_column("feature_id")
+
+new_tax_table = rbind(taxo_ps_trimmed, tax_previous)
+ps = ps %>% prune_taxa(taxa = new_tax_table$feature_id)
+new_tax_table = new_tax_table[match(taxa_names(ps), new_tax_table$feature_id ),]
+all(new_tax_table$feature_id==taxa_names(ps))
+ps@tax_table = tax_table(new_tax_table %>% column_to_rownames("feature_id") %>% as.matrix())
+
+saveRDS(ps, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated.rds"))
+```
+
+### Removing undesired taxa
+```{r}
+ps = readRDS(file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated.rds"))
+ps
+
+ps_trimmed = ps %>% subset_taxa(superkingdom =="Eukaryota" & order %ni% c("Primates","Artiodactyla", "Lepidoptera", "Hymenoptera", "Neuroptera", "Coleoptera", "Diptera", "Araneae","Stylommatophora","Planorbidae","Amphibolidae", "Planorbidae") & class %ni% c("Aves", "Insecta"))
+ps_trimmed
+
+####### Saving updated results
+saveRDS(ps_trimmed,paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean.rds"))
+```
+
+
+### Creating OTUs
+
+```{r}
+ps_run = readRDS(paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean.rds"))
+
+ps_run
+
+cat("\nCreating OTUs\n")
+#dna = ape::read.FASTA(paste0(path_results,"/uniqueSeqs.fasta"))
+dna = ps_run@refseq %>% ape::as.DNAbin()
+	
+clusters <- kmer::otu(dna, threshold = 0.97, nstart = 20, k = 5) %>% 
+	as.data.frame() %>% rownames_to_column("cluster")
+write_csv(x = clusters, paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/clusters.csv"))
+	
+clusters$feature_id = gsub("\\*","", clusters$cluster)
+names(clusters)[2] = "otu_id"
+	
+clusters = clusters %>%
+	dplyr::group_by(otu_id) %>%
+	dplyr::mutate(otu_id = cluster[stringi::stri_detect_fixed(cluster, "*")])
+clusters$otu_id = gsub("\\*","", clusters$otu_id)
+cat("\nNumber of ASVs\n")
+clusters$feature_id %>% unique() %>% length()
+cat("\nNumber of OTUs\n")
+clusters$otu_id %>% unique() %>% length()
+clusters = clusters[match(taxa_names(ps_run),clusters$feature_id),]
+ps_run@tax_table@.Data = ps_run@tax_table@.Data %>% 
+	  as.data.frame() %>% 
+	  dplyr::mutate("otu" = clusters$otu_id) %>% 
+	  as.matrix()
+
+seqtab = ps_run %>% pstoveg_otu() %>% t() %>% 
+	  as.data.frame() %>% 
+	  rownames_to_column("feature_id")
+
+merged_seqtab <- seqtab %>%
+  		dplyr::left_join(clusters %>% dplyr::select(-cluster), by = "feature_id") %>%
+  		dplyr::group_by(otu_id) %>%
+  		dplyr::summarize_at(vars(-feature_id), sum)
+
+# Saving OTU data
+write_csv(x = merged_seqtab, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/otu-table.csv"))
+dna_t = dna[names(dna) %in% merged_seqtab$otu_id]
+ape::write.FASTA(x = dna_t ,file= paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/otu-dna-sequences.fasta"))
+
+saveRDS(ps_run, paste0(path_merged_data, "/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean.rds"))
+
+writeXStringSet(ps_run@refseq, paste0(path_merged_data, "/NUMTs_filtering_COInr/clean_data/ref_seq_superclean.fasta"))
+
+ps_run %>% taxo_assignment_summary()
+ps_temp = ps_run
+ps_temp@tax_table@.Data=ps_temp@tax_table@.Data[,1:8]
+p=metagMisc::phyloseq_taxonomic_resolution(ps_temp)
+p+theme_clean()
+```
+
+
+### Creating a phylogenetic tree
+
+```{r}
+cat("\nAligning sequences\n")
+system2("muscle", args = c("-super5",
+                           "./ref_seq_superclean.fasta",
+                           paste0("-output ","aligned_ref_seq_superclean.fasta")))
+# system2("/Users/Ollilaroche/miniconda3/bin/muscle", args = c("-super5",
+#                            paste0(path_results,"/ref_seq.fasta"),
+#                            paste0("-output ",path_results,"/aligned_ref_seq.fasta")))
+# system2("/Users/olivier/miniforge3/bin/muscle", args = c("-super5",
+#                            paste0(path_results,"/ref_seq_updated.fasta"),
+#                            paste0("-output ",path_results,"/aligned_ref_seq.fasta")))
+
+t = Biostrings::readDNAMultipleAlignment("./aligned_ref_seq_superclean.fasta")
+
+cat("\nComputing distance matrix\n")  
+my_alignment_sequence <- msa::msaConvert(t, type="seqinr::alignment")
+distance_alignment <- seqinr::dist.alignment(my_alignment_sequence)
+  
+cat("\nComputing phylogenetic tree using neighbor joining\n")  
+Tree <- ape::bionj(distance_alignment)
+ps = readRDS("./ps_cleanedMerged_taxupdated_superclean.rds")
+ps@phy_tree = phyloseq::phy_tree(Tree)
+
+cat("\nRooting the tree using the longest branch\n")  
+pick_new_outgroup <- function(tree.unrooted){
+  require("magrittr")
+  require("data.table")
+  require("ape") # ape::Ntip
+  # tablify parts of tree that we need.
+  treeDT <- 
+      cbind(
+        data.table(tree.unrooted$edge),
+        data.table(length = tree.unrooted$edge.length)
+      )[1:ape::Ntip(tree.unrooted)] %>% 
+      cbind(data.table(id = tree.unrooted$tip.label))
+    # Take the longest terminal branch as outgroup
+    new.outgroup <- treeDT[which.max(length)]$id
+    return(new.outgroup)
+}
+
+new.outgroup = pick_new_outgroup(ps@phy_tree)
+ps@phy_tree = ape::root(ps@phy_tree, outgroup=new.outgroup, resolve.root=TRUE)
+
+### Saving results
+saveRDS(ps, file = "ps_cleanedMerged_taxupdated_superclean_wTree.rds")
+#ape::write.tree(ps_trimmed@phy_tree, file = paste0(path_results,"/ps_superclean_updated_wTree.tree"))
+```
+
+
+### Updating metadata if needed
+```{r eval=FALSE, include=FALSE}
+m_extra = read_csv(file = "../../../Data/Metadata/complete_metadata.csv") %>% 
+  dplyr::filter(target_gene == "COI")
+
+ps = readRDS(file = paste0(path_merged_data, "/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+ps = ps %>% microViz::ps_select(cawthron_id)
+ps@sam_data$cawthron_id = sample_names(ps)
+m=ps %>% pstoveg_sample()
+
+rd1 = fread("../../../../Cruises_7A-7B/Metabarcoding_data/CAW-24-05/COI/DADA2_results/Read_counts.csv")
+colnames(rd1)[1] = "cawthron_id"
+rd1$percent_retained_reads = round(rd1$nonchim / rd1$demultiplexed * 100,2)
+
+rd2 = fread("../../../../Cruises_7A-7B/Metabarcoding_data/CAW-24-06/COI/DADA2_results/Read_counts.csv")
+colnames(rd2)[1] = "cawthron_id"
+rd2$percent_retained_reads = round(rd2$nonchim / rd2$demultiplexed * 100,2)
+
+rd3 = fread("../../../../Cruises_7A-7B/Metabarcoding_data/Extra_data/UoH/COI/DADA2_results/Read_counts.csv")
+colnames(rd3)[1] = "cawthron_id"
+rd3$percent_retained_reads = round(rd3$nonchim / rd3$demultiplexed * 100,2)
+rd3$input=NA
+
+rd4 = fread("../../../Data/metabarcoding/COI/DADA2_results/Read_counts.csv")
+colnames(rd4)[1] = "cawthron_id"
+rd4$percent_retained_reads = round(rd4$nonchim / rd4$demultiplexed * 100,2)
+rd4$input=NA
+
+rd =rbind(rd1,rd2)
+rd =rbind(rd,rd3)
+rd =rbind(rd,rd4)
+
+m = left_join(m,rd)
+
+m_new = left_join(m, m_extra, 
+                  by = "cawthron_id", unmatched = "drop",keep=F, multiple="first")
+
+all(sample_names(ps) == m_new$cawthron_id)
+ps@sam_data = sample_data(m_new)
+rownames(ps@sam_data) = sample_names(ps)
+
+######################
+Metadata = ps@sam_data %>% data.frame()
+Metadata  = Metadata %>% rownames_to_column('sample-id')
+write.table(Metadata, paste0(path_merged_data, "/NUMTs_filtering_COInr/clean_data/metadata_table.txt"), quote = F, row.names = F, sep = "\t")
+saveRDS(ps, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+```
+
+
+### Making sure that ASVs from same OTU have same taxonomy
+```{r}
+ps = readRDS(paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+ps@tax_table@.Data = ps@tax_table@.Data %>% as.data.frame() %>% dplyr::mutate("asv" = taxa_names(ps)) %>% as.matrix()
+
+source("../Data_analysis/custom_functions/normalized_otu_taxo.R")
+ps = normalized_otu_taxo(physeq_obj = ps, otu_column = "otu",asv_column = "asv")
+saveRDS(ps, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+```
+
+### Adding the Protozoa and Plantae group
+```{r}
+source("../Data_analysis/custom_functions/proto_assignment.R")
+ps = readRDS(paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+ps = proto_assignment(physeq_obj = ps, 
+                      db_path = "~/Dropbox/R_scripts_N_bioinfo/Building_packages/biohelper/accessionTaxa.sql")
+saveRDS(ps, file = paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+```
+
+
+### 8A subset for TMC
+```{r}
+ps = readRDS(paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleanedMerged_taxupdated_superclean_wTree.rds"))
+ps
+ps_8A = ps %>% subset_samples(campaign_id == "NORI_D_C8A") %>%
+  phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE)
+ps_8A
+
+ASV_table = ps_8A %>% pstoveg_otu() %>% t() %>% as.data.frame() %>% rownames_to_column('feature-id') 
+write.table(ASV_table,paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ASV_table_8A.txt"), quote = F, row.names = F, sep = "\t")
+
+Taxo_table = ps_8A@tax_table@.Data %>% as.data.frame()
+Taxo_table  = Taxo_table %>% rownames_to_column('feature-id')
+write.table(Taxo_table,paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/taxonomy_table_8A.txt"), quote = F, row.names = F, sep = "\t")
+
+saveRDS(ps_8A,paste0(path_merged_data,"/NUMTs_filtering_COInr/clean_data/ps_cleaned_8A.rds"))
+```
+
+
+
+
+
+

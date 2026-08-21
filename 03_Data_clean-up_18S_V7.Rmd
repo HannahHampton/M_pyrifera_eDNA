@@ -1,0 +1,353 @@
+---
+title: "Data clean-up | 18S V7 | CAW-25-03"
+author: "Olivier Laroche"
+date: "January, 2025"
+output: 
+  distill::distill_article:
+    toc: true
+    theme: night
+    highlight: pygments
+    center: true
+code_folding: true
+---
+
+
+### Loading libraries
+
+```{r Loading libraries, message=FALSE, warning=FALSE, code_folding=TRUE, include=FALSE}
+library(biohelper)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(Biostrings)
+library(janitor)
+library(ggthemes)
+library(DT)
+library(tibble)
+library(tidyverse)
+library(UpSetR)
+library(vegan)
+library(plotly)
+library(crosstalk)
+library(ranacapa)
+library(plyr)
+library(glue)
+library(theseus)
+library(microViz)
+```
+
+### Setting up the environment
+```{r}
+path_metabarcoding_data = "../../../Metabarcoding_data/18S_V7/DADA2_results/"
+path_metadata = "../../../Metabarcoding_data/short_amplicon_metadata_kelp.csv"
+```
+
+
+### Loading the ps object and adding metadata
+
+```{r Loading files, message=FALSE, warning=FALSE, code_folding=TRUE}
+ps = readRDS(paste0(path_metabarcoding_data,"ps_run.rds")) %>% microViz::phyloseq_validate()
+ps
+
+# !!! Add sequench blanks
+metadata =  fread(path_metadata) %>% clean_names() %>% remove_empty(c("rows", "cols")) %>% 
+  dplyr::filter(genes == "18sV7") %>% 
+  dplyr::filter(sequench_id %in% sample_names(ps))
+
+sample_names(ps)[sample_names(ps) %ni% metadata$sequench_id]
+
+if(all(metadata$sequench_id %in% sample_names(ps))){
+    cat("\nAll metadata samples are in the ASV table\n")
+}else{
+    cat("\nMissing samples in the ASV table?\n")
+    cat(metadata$sequench_id[which(metadata$sequench_id %ni% sample_names(ps))])
+}
+
+if(all(sample_names(ps) %in% metadata$sequench_id)){
+  cat("\nAll samples in the ASV table are in the metadata\n")
+  metadata = metadata[match(sample_names(ps),metadata$sequench_id),]
+} else{
+    cat("\nMissing samples in the metadata table?\n")
+    cat(sample_names(ps)[which(sample_names(ps) %ni% metadata$sequench_id)])
+}
+
+cat("\nAdding metadata to the ps object\n")
+all(sample_names(ps) == metadata$sequench_id)
+ps = merge_phyloseq(ps,sample_data(metadata) %>% magrittr::set_rownames(metadata$sequench_id))
+ps@sam_data$original_sample_id = ps@sam_data$sample_id
+ps@sam_data$sample_id = sample_names(ps)
+
+ps@tax_table@.Data = ps@tax_table@.Data %>% as.data.frame() %>% dplyr::mutate("asv" = taxa_names(ps)) %>% as.matrix()
+t = ps@tax_table@.Data %>% as.data.frame()
+```
+
+
+### Inspecting data and library size
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, code_folding=TRUE}
+cat("\n\nData info\n")
+ps
+cat("\n\nMetadata info\n")
+metadata %>% skimr::skim()
+
+df <- ps %>% pstoveg_sample() 
+if(is.null(df$sample_id)){
+  df = df %>% rownames_to_column("sample_id")
+}
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+p1=ggplot(data=df[df$amplicon_type == "sample",], aes(x=Index, y=LibrarySize, colour = amplicon_type, label = sample_id)) + geom_point() + theme_stata() + ggtitle("Sequencing depth per sample") +xlab("Sample index") + ylab("Library size") + scale_color_brewer(palette="Paired",name = "Amplicon type")
+p2=ggplot(data=df[df$amplicon_type != "sample",], aes(x=Index, y=LibrarySize, colour = amplicon_type, label = sample_id)) + geom_point() + theme_stata() + ggtitle("Sequencing depth per blank") +xlab("Sample index") + ylab("Library size") + scale_color_brewer(palette="Paired",name = "Amplicon type")
+
+ggplotly(p1)
+ggplotly(p2)
+```
+
+### Inspection of contamination
+#### Looking at reads and richness in blanks
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#Subsetting floc blanks
+ps_blanks = ps %>% subset_samples(amplicon_type != "sample") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE)
+ps_blanks
+# 
+# # Creating a table
+Contamination = ps_blanks %>% sample_names() %>% as.data.frame(stringsAsFactors=F)
+names(Contamination) = "sample_name"
+# ## Samples sum
+Contamination$Read_count = ps_blanks %>% sample_sums() 
+Contamination$Blank_type = ps_blanks@sam_data$amplicon_type
+# 
+# ## Diversity
+R = estimate_richness(ps_blanks, measures="Observed")
+Contamination$Richness = R$Observed
+# 
+# ## Ordering the table
+Contamination = Contamination %>% dplyr::arrange(Richness)
+# 
+Contamination %>% datatable(class = 'cell-border stripe', caption = "Blanks and their read count and richness", options = list(pageLength = 100))
+# 
+dir.create(paste0(path_metabarcoding_data,"Contamination"))
+write.table(Contamination,paste0(path_metabarcoding_data,"Contamination/Contamination.txt"), quote = F, sep = "\t", row.names = F)
+```
+
+#### Proportion of blank ASVs only in blanks
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, collapse=T}
+ASVs_in_Blanks = taxa_names(ps_blanks)
+ASVs_in_Blanks_only = ASVs_in_Blanks[which(ASVs_in_Blanks %ni% (ps %>%subset_samples(amplicon_type == "sample") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% taxa_names()) )]
+
+paste0("Percent of ASVs in blanks only found in blanks: ",round(length(ASVs_in_Blanks_only)/length(ASVs_in_Blanks)*100,2)," %")
+```
+
+#### Looking at the importance of ASVs found in contamination
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, collapse=T, fig.height=8, fig.width=10}
+ps_samples_RA = ps %>% subset_samples(amplicon_type == "sample") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% microbiome::transform(transform = "compositional")
+ps_samples_RA_contam = ps_samples_RA %>% subset_taxa(asv %in% ASVs_in_Blanks)
+
+tb = round(taxa_sums(ps_samples_RA_contam) / nsamples(ps_samples_RA_contam) *100,2) %>% as.data.frame() %>% setNames("Mean relative abundance per taxa (%)") %>% dplyr::arrange("Mean relative abundance per taxa (%)") 
+tax = ps@tax_table@.Data %>% as.data.frame()
+tb$taxo = ""
+
+for (i in 1:nrow(tb)) {
+  tb$taxo[i] = tax[tax$asv == rownames(tb)[i],] %>% unite('taxo', kingdom:genus, sep = ": ")
+}
+
+round(sample_sums(ps_samples_RA_contam) *100,2) %>% as.data.frame() %>% setNames("Mean relative abundance per sample (%)") %>% dplyr::arrange(desc(`Mean relative abundance per sample (%)`)) %>% datatable(class = 'cell-border stripe', caption = "Mean relative abundance of taxa found in blanks in samples", options = list(pageLength = 10))
+
+df_ps_samples_RA_contam = ps_samples_RA_contam %>% psmelt()
+
+fig2 <- plot_ly(df_ps_samples_RA_contam, x = ~sample_id, y = ~Abundance*100, color = ~family, type = 'bar') %>% layout(yaxis = list(title = 'Relative abundance (%)'), barmode = 'stack') %>% layout(legend=list(title=list(text='<b> Family </b>')))
+fig2
+
+ASVs_in_Blanks_only2 = speedyseq::psmelt(ps_samples_RA_contam)
+ASVs_in_Blanks_only2 = ASVs_in_Blanks_only2 %>% dplyr::group_by(kingdom, phylum, class, order, family, genus, asv) %>% dplyr::summarise(Mean_RA = round(mean(Abundance)*100,2), SD = sd(Abundance)*100 ) %>% dplyr::arrange(desc(Mean_RA))
+
+write.table(ASVs_in_Blanks_only2, paste0(path_metabarcoding_data,"Contamination/Taxo_blank_ASVs_in_samples.txt"), quote = F, row.names = F, sep = "\t")
+```
+
+#### Viewing blanks composition
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ps_blanks = ps %>% subset_samples(amplicon_type %ni% c("sample","Sample")) %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% microbiome::transform(transform = "compositional")
+ps_blanks@refseq =NULL
+
+ps_merged = ps %>% subset_samples(amplicon_type %in% c("sample","Sample")) %>% merge_samples("amplicon_type") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% microbiome::transform(transform = "compositional")
+
+ps_blanks = merge_phyloseq(ps_blanks,ps_merged) %>% microbiome::transform(transform = "compositional")
+
+pblank = taxo_bar_plot(ps_obj = ps_blanks, rank1 = "phylum", rank2 = "family", label = "amplicon_type")
+ggplotly(pblank)
+```
+
+
+#### Effect of removing blanks following different methodologies
+
+```{r echo=FALSE}
+cat("\nRemoving all taxa found in blanks\n")
+ps_trimmed = ps %>% biohelper::ps_decon(method = "complete_asv_removal")
+
+cat("\nRemoving reads from taxa found in blanks using max_v\n")
+ps_trimmed = ps %>% biohelper::ps_decon(method = "max_v")
+
+ps@sam_data$grp = paste0(ps@sam_data$extraction_blank_number, "_",ps@sam_data$pcr_batches)
+cat("\nRemoving reads from taxa found in blanks using microDecon\n")
+ps_trimmed = ps %>% biohelper::ps_decon(method = "microDecon", group = "grp")
+```
+
+
+
+### Looking at eukaryotic and non-eukaryotic taxa
+
+```{r echo=FALSE, fig.height=5, fig.width=10, collapse=TRUE}
+paste0("Number of reads from Eukaryotes: ",ps_trimmed %>% subset_taxa(superkingdom == "Eukaryota" | family %ni% "Hominidae") %>% sample_sums() %>% sum())
+paste0("Number of reads from non-eukaryotes: ",ps_trimmed %>% subset_taxa(superkingdom != "Eukaryota" | family %in% "Hominidae")%>% sample_sums() %>% sum())
+
+Non_euk_ASVs = ps_trimmed %>% subset_taxa(superkingdom != "Eukaryota" | family %in% "Hominidae") %>% taxa_names()
+
+ps_trimmed_non_euk = ps_trimmed %>% transform_sample_counts(function(x) 100 * x/sum(x)) %>% subset_taxa(superkingdom!="Eukaryota"| family %in% "Hominidae") 
+
+ps_trimmed_non_euk@tax_table@.Data = ps_trimmed_non_euk@tax_table@.Data %>% as.data.frame() %>% replace(is.na(.), "NA") %>% as.matrix()
+tax2 = ps_trimmed_non_euk@tax_table@.Data %>% as.data.frame() 
+
+plot_bar(ps_trimmed_non_euk, 'sample_id', fill = "phylum", title = "Non-eukaryotes reads") + ylab("Reads (%)") + theme_calc() + theme(axis.text.x = element_text(angle = 90, size=4)) + xlab("Sample unique ID")
+
+# Looking at percent of ASVs belonging to non-Eukaryota
+Non_euk_ASVs_nb = ps_trimmed %>% subset_taxa(superkingdom != "Eukaryota" | family %in% "Hominidae") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% taxa_names() %>% length()
+Euk_ASVs_nb = ps_trimmed %>% subset_taxa(superkingdom == "Eukaryota" | family %ni% "Hominidae") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% taxa_names() %>% length()
+paste0("Percent of non-eukaryotes ASVs: ",round(Non_euk_ASVs_nb/Euk_ASVs_nb *100,2)," %")
+
+# Looking at percent of reads belonging to non-Eukaryota
+Non_euk_reads_nb = ps_trimmed %>% subset_taxa(superkingdom != "Eukaryota" | family %in% "Hominidae") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% sample_sums() %>% sum()
+Euk_reads_nb = ps_trimmed %>% subset_taxa(superkingdom == "Eukaryota" | family %ni% "Hominidae") %>% phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) %>% sample_sums() %>% sum()
+paste0("Percent of non-eukaryotes reads: ",round(Non_euk_reads_nb/Euk_reads_nb *100,5)," %")
+```
+
+#### Removing non-eukaryotic ASVs (including homonidae)
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, collapse=T}
+ps_trimmed_euk = ps_trimmed %>% subset_taxa(superkingdom=="Eukaryota" & family %ni% "Hominidae" & class %ni% "Aves") 
+# # Looking at read counts
+# cat("\nBefore data\n")
+# ps_trimmed
+# paste0("Total number of reads: ",ps_trimmed %>% sample_sums() %>% sum())
+# cat("\nAfter data\n")
+# ps_trimmed_euk
+# paste0("Total number of reads: ",ps_trimmed_euk %>% sample_sums() %>% sum())
+
+# Adding reads lost for sediment samples (processed in another script)
+before = ps_trimmed %>% sample_sums() %>% sum()
+after = ps_trimmed_euk %>% sample_sums() %>% sum()
+before_r = ps_trimmed %>% taxa_names() %>% length()
+after_r = ps_trimmed_euk %>% taxa_names() %>% length()
+
+cat("\nTotal number of lost ASVs and reads after non-eukaryote ASVs removal\n")
+paste0("Lost reads: ", before-after)
+paste0("Lost ASVs: ", before_r-after_r)
+
+cat("\nPercent of lost ASVs and reads after non-eukaryote ASVs removal\n")
+paste0("Lost reads: ",round(100-(after/before * 100),2)," %")
+paste0("Lost ASVs: ",round(100-(after_r/before_r * 100),2)," %")
+```
+
+### Looking at number of rare ASVs
+
+```{r echo=FALSE, fig.height=6, fig.width=10, message=FALSE, warning=FALSE, collapse=TRUE}
+TS = sort(taxa_sums(ps_trimmed_euk)) %>% as.data.frame() %>% rownames_to_column("ASV")
+
+p1= ggplot(TS, aes(.)) + geom_histogram() + theme_stata() + scale_x_sqrt(limits= c(0,10000), breaks = c(1,5,10,500,2500,5000,7500,10000)) + scale_y_sqrt(breaks = c(100, 1000, 5000,10000,25000,50000)) + xlab("Reads/ASV") + ylab("Number of ASVs") + ggtitle("ASVs distribution")
+
+cat("\nProportions of rare ASVs in samples\n")
+
+paste0("Singletons: ",taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  == 1] %>% length(),": ",round(taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  == 1] %>% length()/taxa_sums(ps_trimmed_euk)%>% length()*100,2)," %")
+
+paste0("Doubletons: ",taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  == 2] %>% length(),": ",round(taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  == 2] %>% length()/taxa_sums(ps_trimmed_euk)%>% length()*100,2)," %")
+
+paste0("Less than 10 reads: ",taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  <10] %>% length(),": ",round(taxa_sums(ps_trimmed_euk)[taxa_sums(ps_trimmed_euk)  <10] %>% length()/taxa_sums(ps_trimmed_euk)%>% length()*100,2)," %")
+
+p1
+```
+
+### Effect of removing rare ASVs 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, collapse=TRUE}
+# Filtering taxa -------------------------------------------------
+ps_trimmed_euk_min = phyloseq::filter_taxa(ps_trimmed_euk %>% phyloseq_validate(), function(x) sum(x > 10) > (1), TRUE)
+
+# Adding reads lost for sediment samples (processed in another script)
+before = ps_trimmed_euk %>% sample_sums() %>% sum()
+after = ps_trimmed_euk_min %>% sample_sums() %>% sum()
+
+cat("\nPercent of lost reads after rare ASVs removal\n")
+paste0("Lost reads: ",round(100-(after/before * 100),2)," %")
+cat("\nPercent of lost ASVs after rare ASVs removal\n")
+paste0("Lost ASVs: ",round(100-(ntaxa(ps_trimmed_euk_min)/ntaxa(ps_trimmed_euk) * 100),2)," %")
+```
+
+### Looking at sequencing depth per sample with rarefaction curves
+
+```{r , message=FALSE, warning=FALSE, collapse=TRUE, include=FALSE}
+ps_trimmed_euk_min = ps_trimmed_euk # Keeping rare taxa for now
+ps_trimmed_euk_min <- prune_samples(sample_sums(ps_trimmed_euk_min)>100, ps_trimmed_euk_min)
+
+dir.create(paste0(path_metabarcoding_data,"/Cleaned_data"))
+dir.create(paste0(path_metabarcoding_data,"/Cleaned_data/Sequencing_depth"))
+
+s = sample_sums(ps_trimmed_euk_min) %>% sort()
+x = split(s, ceiling(seq_along(s)/10))
+xx <- plyr::ldply(x, function(x){
+    plyr::rename(ldply(x, function(z) {data.frame(read_count=z)}),c(".id" = ".id2"))
+})
+xx =xx %>% dplyr::group_by(.id) %>% dplyr::mutate(.id3 = max(read_count))
+xx = xx[match(sample_names(ps_trimmed_euk_min),xx$.id2),]
+ps_trimmed_euk_min@sam_data$read_count_gr = paste0("Group_",xx$.id," (<=",xx$.id3,")")
+ps_trimmed_euk_min@sam_data$read_count_gr = factor(ps_trimmed_euk_min@sam_data$read_count_gr, levels = gtools::mixedsort(ps_trimmed_euk_min@sam_data$read_count_gr %>% unique()))
+p <- ranacapa::ggrare(ps_trimmed_euk_min, step = 1000, color = "read_count_gr",  se = FALSE)
+p <- p + facet_wrap(~read_count_gr,scales = "free_x") + theme_bw() + ylab("ASV richness") + xlab("Sequencing depth") + guides(color=guide_legend(title="Sequencing depth")) + theme(axis.text.x = element_text(angle = 45))
+ggsave(plot = p, filename = "rarefaction_curves.pdf", path = paste0(path_metabarcoding_data,"/Cleaned_data/Sequencing_depth/"), device = "pdf", width = 12, height = 8)
+```
+
+```{r echo=FALSE, fig.height= 8, fig.width=16}
+ggplotly(p)
+```
+
+
+### Looking at read count per sample and removing those with less than X reads.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+df_read_count = ps_trimmed_euk_min %>% phyloseq::sample_sums() %>% sort() %>% as.data.frame(col.names = "Reads")
+colnames(df_read_count) = "Read count"
+df_read_count %>% datatable(class = 'cell-border stripe', caption = "Read count per sample after decontamination", options = list(pageLength = 10))
+
+# Filtering samples -------------------------------------------------
+ps_trimmed_euk_min_min = phyloseq::prune_samples(phyloseq::sample_sums(ps_trimmed_euk_min) >= 2000, ps_trimmed_euk_min)
+```
+
+### Saving results
+
+```{r message=FALSE, warning=FALSE, code_folding=TRUE}
+ps_trimmed_euk_min_min
+saveRDS(ps_trimmed_euk_min_min,paste0(path_metabarcoding_data,"/Cleaned_data/ps_clean.rds"))
+
+# # Txt tables ----------------------------------------------------
+ASV_table = ps_trimmed_euk_min_min %>% pstoveg_otu() %>% t() %>% as.data.frame() %>% rownames_to_column('feature-id') 
+write.table(ASV_table,paste0(path_metabarcoding_data,'/Cleaned_data/ASV_table.txt'), quote = F, row.names = F, sep = "\t")
+
+Taxo_table = ps_trimmed_euk_min_min@tax_table@.Data %>% as.data.frame()
+Taxo_table  = Taxo_table %>% rownames_to_column('feature-id')
+write.table(Taxo_table,paste0(path_metabarcoding_data,"/Cleaned_data/taxonomy_table.txt"), quote = F, row.names = F, sep = "\t")
+
+Metadata = ps_trimmed_euk_min_min@sam_data %>% data.frame()
+Metadata  = Metadata %>% rownames_to_column('sample-id')
+write.table(Metadata,paste0(path_metabarcoding_data,"/Cleaned_data/metadata_table.txt"), quote = F, row.names = F, sep = "\t")
+
+writeXStringSet(ps_trimmed_euk_min_min@refseq,paste0(path_metabarcoding_data,"/Cleaned_data/ref_seq.fasta"))
+```
+
+
+
+
+
+
+
+
